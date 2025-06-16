@@ -1,48 +1,106 @@
-Uninitialized Kernel Memory Disclosure in afd.sys via SIO_ADDRESS_LIST_QUERY
+Silent Kernel Pool Leak in AFD.sys via SIO_ADDRESS_LIST_QUERY
 
-A kernel information leak exists in Windows’ AFD (Ancillary Function Driver) subsystem due to uninitialized pool memory being copied to user-mode in response to certain IOCTLs, including SIO_ADDRESS_LIST_QUERY. Any local user can use this to leak portions of kernel memory, including potentially sensitive data, on fully patched Windows 11 systems.
+Abstract
 
-Root Cause
+AFD.sys’s central IOCTL dispatcher allocates nonpaged-pool buffers for socket-related IOCTLs but never zeros them before copying out the full allocation to user mode. This “pool-slack” leak allows any unprivileged process to read stale kernel memory—defeating KASLR and exposing sensitive data.
 
-Central IOCTL Dispatcher: All AFD IOCTLs are routed through a central dispatch routine (e.g., FUN_1c0001b10 in decompiled builds), which chooses the appropriate handler for each control code.
+1. Background: AFD and WSAIoctl
+   
+   AFD.sys is the kernel driver behind Winsock operations.
 
-Uninitialized Pool Allocations: Handlers allocate nonpaged pool buffers for output (e.g., using ExAllocatePool3 or lookaside lists) but do not zero the buffer.
+   All socket IOCTLs (e.g. SIO_ADDRESS_LIST_QUERY) are routed through a single dispatch routine.
 
-Partial Buffer Initialization: The handler writes a small header and the actual payload into the buffer, but leaves the rest (“slack space”) uninitialized.
+   User-mode calls WSAIoctl(..., SIO_ADDRESS_LIST_QUERY, NULL,0, OutBuf, Size, &Returned, NULL, NULL) to enumerate local addresses.
 
-Blind Copy-Out: The handler then copies the entire buffer (including uninitialized slack) back to user-mode, exposing stale kernel memory.
+2. IOCTL Dispatch Entry Point
 
-This pattern occurs both for large allocations (pool) and smaller ones (lookaside list), and also appears in handlers that use MDL-mapped buffers.
+   The decompiled dispatcher (here called FUN_1c0001b10) shares these hallmarks of a classic IOCTL handler:
 
-Reproduction Steps
+      32/64-bit check – to validate alignment of user pointers.
 
-PoC Code (see below): A simple user-mode program calls WSAIoctl() with SIO_ADDRESS_LIST_QUERY and a large output buffer.
+      Fetch IoControlCode and buffer pointers from the IRP.
 
-Observe: The returned buffer contains the valid header and payload, followed by uninitialized bytes—0xCC in debug builds, but real, potentially sensitive data in retail builds.
+      Parameter checks (size, permissions, handle validation).
 
-Impact
+      MDL allocation & page-locking for some paths.
 
-KASLR Bypass: Kernel pointers may leak, helping attackers defeat address randomization.
+      Subroutine calls based on the IOCTL code.
 
-Sensitive Data Disclosure: Exposed pool slack can contain credentials, tokens, or other private structures.
+      IofCompleteRequest with the final status.
 
-Privilege Escalation: When chained with another kernel bug (e.g., write-what-where), this leak can assist in full SYSTEM compromise.
+      Despite all that, there is no zero-initialization of newly allocated output buffers.
 
-Mitigation & Remediation
+3. Vulnerability Flow
+   
+    1.Pool Allocation Without Zeroing
+   
+plVar10 = ExAllocatePool3(
+    NonPagedPool,
+    requestedSize,    // attacker-controlled
+    'AdfR',
+    &status
+);
+// NO RtlZeroMemory or ExAllocatePoolZero call here
+     
+     
+    2.Partial Initialization
 
-Temporary Workaround: Restrict or monitor unprivileged use of SIO_ADDRESS_LIST_QUERY.
 
-Proper Fix: Zero all newly allocated output buffers before populating or copying them back to user-mode (e.g., use RtlZeroMemory() or ExAllocatePoolZero()).
+// Write header + payload only:
+*(ULONG*)plVar10           = entryCount;
+*(USHORT*)(plVar10 + 4)    = payloadLength;
+memcpy(plVar10 + headerOffset, userSrc, payloadLength);
 
-Technical Details
+3.Blind Copy-Out
 
-Driver: afd.sys (Ancillary Function Driver for WinSock)
 
-IOCTL Path: All output buffers allocated by handlers for socket queries (e.g., SIO_ADDRESS_LIST_QUERY) are not zeroed.
+// Driver’s memcpy helper:
+FUN_1c001e840(
+    plVar10,            // source (kernel pool)
+    IRP->UserBuffer,    // dest (user buffer)
+    outputLength        // attacker-controlled or = requestedSize
+);
+Any bytes beyond headerOffset + payloadLength are left uninitialized—leaking stale pool contents.
 
-Observed On: Windows 11 Home (10.0.22631, Build 22631)
+4.Lookaside Path
 
-Conclusion
+Small requests use ExAllocateToLookasideListEx, again without zeroing.
 
-This is a classic case of uninitialized kernel pool memory being leaked to user-mode, which can have serious security implications. All kernel output buffers exposed to user-mode should be zeroed or carefully initialized before being copied out.
+5.MDL-Mapped Path
+
+Some handlers build an MDL, map it into system space, write header+payload, then unmap. The unmapped tail is still uninitialized.
+
+5. Impact
+6. 
+KASLR Bypass: Leaked kernel pointers let attackers pinpoint kernel base addresses.
+
+Data Disclosure: Slack may contain credentials, tokens, heap metadata, or other sensitive info.
+
+Privilege Escalation: Combined with a write-primitive, this leak can facilitate full SYSTEM compromise.
+
+6. Root Cause
+
+AFD’s IOCTL handlers allocate pool or lookaside buffers for output but never clear them before copying out the entire region. No calls to zeroing routines (RtlZeroMemory, ExAllocatePoolZero, etc.) appear in the dispatch or handlers.
+
+This subtle “pool-slack” leak in AFD.sys exemplifies how an innocent-looking omission—failing to zero freshly allocated memory—can lead to powerful information disclosure. By addressing it, Windows can prevent trivial user-mode leaks of kernel memory in socket-related IOCTLs.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
